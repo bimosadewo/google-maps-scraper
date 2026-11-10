@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"net/url"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +29,9 @@ type fetchReviewsParams struct {
 
 type FetchReviewsResponse struct {
 	pages [][]byte
+	// truncated explains why pagination stopped before Google ran out of
+	// pages; empty means every page Google offered was fetched.
+	truncated string
 }
 
 type fetcher struct {
@@ -49,14 +55,9 @@ func (f *fetcher) fetch(ctx context.Context) (FetchReviewsResponse, error) {
 		return FetchReviewsResponse{}, fmt.Errorf("failed to generate session request ID: %v", err)
 	}
 
-	reviewURL, err := f.generateURL(f.params.mapURL, "", 20, requestIDForSession)
-	if err != nil {
-		return FetchReviewsResponse{}, fmt.Errorf("failed to generate initial URL: %v", err)
-	}
-
 	// First, try to fetch using the browser's session (has cookies/authentication)
 	if f.params.page != nil {
-		ans, err := f.fetchWithBrowser(ctx, reviewURL, requestIDForSession)
+		ans, err := f.paginate(ctx, requestIDForSession, f.fetchPageWithBrowser)
 		if err == nil && len(ans.pages) > 0 {
 			return ans, nil
 		}
@@ -65,46 +66,213 @@ func (f *fetcher) fetch(ctx context.Context) (FetchReviewsResponse, error) {
 	}
 
 	// Fallback to direct HTTP (may fail due to lack of authentication)
-	currentPageBody, err := f.fetchReviewPage(ctx, reviewURL)
+	ans, err := f.paginate(ctx, requestIDForSession, f.fetchReviewPage)
 	if err != nil {
 		log.Printf("RPC fetch failed, will try DOM extraction: %v", err)
 		return FetchReviewsResponse{}, err
 	}
 
-	ans := FetchReviewsResponse{}
-	ans.pages = append(ans.pages, currentPageBody)
+	return ans, nil
+}
 
-	nextPageToken := extractNextPageToken(currentPageBody)
+// reviewPageGetter downloads one listugcposts page. It is the only part of
+// pagination that differs between the browser session and plain HTTP, so the
+// paging, retry and stop rules live in one place (paginate) and can be tested
+// without a browser.
+type reviewPageGetter func(ctx context.Context, u string) ([]byte, error)
+
+// Pagination limits. The previous implementation stopped silently after 50
+// pages (1,000 reviews) and on the first failed page, which made large places
+// look complete while missing most of their reviews.
+const (
+	reviewPageSize = 20
+
+	// Safety net only: 2,500 pages = 50,000 reviews. Pagination normally ends
+	// when Google stops returning a next-page token.
+	defaultMaxReviewPages = 2500
+
+	// A failed page is retried with exponential backoff instead of ending the
+	// whole fetch: 1s, 2s, 4s, 8s, 16s (+ jitter).
+	reviewPageAttempts  = 6
+	reviewRetryBaseWait = time.Second
+)
+
+// Delay between successful pages, randomized within [min, max). Overridable
+// in tests.
+var (
+	reviewPageDelayMin = 300 * time.Millisecond
+	reviewPageDelayMax = 900 * time.Millisecond
+	reviewSleep        = sleepContext
+)
+
+// maxReviewPages returns the page cap; GMAPS_MAX_REVIEW_PAGES overrides it
+// (0 or invalid keeps the default).
+func maxReviewPages() int {
+	if v, err := strconv.Atoi(os.Getenv("GMAPS_MAX_REVIEW_PAGES")); err == nil && v > 0 {
+		return v
+	}
+
+	return defaultMaxReviewPages
+}
+
+// paginate walks every listugcposts page until Google stops returning a
+// next-page token. Each page is retried on failure; only after all attempts
+// fail is the result returned as partial (with truncated set) instead of
+// pretending to be complete.
+func (f *fetcher) paginate(ctx context.Context, requestID string, get reviewPageGetter) (FetchReviewsResponse, error) {
+	ans := FetchReviewsResponse{}
+
+	firstURL, err := f.generateURL(f.params.mapURL, "", reviewPageSize, requestID)
+	if err != nil {
+		return ans, fmt.Errorf("failed to generate initial URL: %v", err)
+	}
+
+	body, err := fetchPageWithRetry(ctx, get, firstURL)
+	if err != nil {
+		return ans, err
+	}
+
+	ans.pages = append(ans.pages, body)
+
+	limit := maxReviewPages()
+	seen := map[string]bool{}
+	nextPageToken := extractNextPageToken(body)
 
 	for nextPageToken != "" {
-		reviewURL, err = f.generateURL(f.params.mapURL, nextPageToken, 20, requestIDForSession)
-		if err != nil {
-			log.Printf("Error generating URL for token %s: %v", nextPageToken, err)
+		if seen[nextPageToken] {
+			// Google handed back a token we already followed; continuing would loop.
+			log.Printf("reviews: repeated page token after %d pages, stopping", len(ans.pages))
+
 			break
 		}
 
-		currentPageBody, err = f.fetchReviewPage(ctx, reviewURL)
-		if err != nil {
-			log.Printf("Error fetching review page with token %s: %v", nextPageToken, err)
+		seen[nextPageToken] = true
+
+		if len(ans.pages) >= limit {
+			ans.truncated = fmt.Sprintf("page limit %d reached", limit)
+			log.Printf("reviews: %s; set GMAPS_MAX_REVIEW_PAGES to raise it", ans.truncated)
+
 			break
 		}
 
-		ans.pages = append(ans.pages, currentPageBody)
-		nextPageToken = extractNextPageToken(currentPageBody)
+		if err := reviewSleep(ctx, randomDelay(reviewPageDelayMin, reviewPageDelayMax)); err != nil {
+			ans.truncated = "cancelled: " + err.Error()
+
+			break
+		}
+
+		nextURL, err := f.generateURL(f.params.mapURL, nextPageToken, reviewPageSize, requestID)
+		if err != nil {
+			ans.truncated = "url error: " + err.Error()
+			log.Printf("reviews: %s", ans.truncated)
+
+			break
+		}
+
+		body, err = fetchPageWithRetry(ctx, get, nextURL)
+		if err != nil {
+			ans.truncated = fmt.Sprintf("page %d failed after %d attempts: %v", len(ans.pages)+1, reviewPageAttempts, err)
+			log.Printf("reviews: %s", ans.truncated)
+
+			break
+		}
+
+		ans.pages = append(ans.pages, body)
+		nextPageToken = extractNextPageToken(body)
 	}
 
 	return ans, nil
 }
 
-// fetchWithBrowser uses Playwright to fetch the review API with browser cookies
-func (f *fetcher) fetchWithBrowser(_ context.Context, initialURL, requestID string) (FetchReviewsResponse, error) {
-	ans := FetchReviewsResponse{}
-	page := f.params.page
+// fetchPageWithRetry retries a page with exponential backoff. A response that
+// is not a parseable listugcposts payload counts as a failure, because Google
+// answers throttled requests with HTML or an empty body as well as with 429.
+func fetchPageWithRetry(ctx context.Context, get reviewPageGetter, u string) ([]byte, error) {
+	var lastErr error
 
-	// Use JavaScript fetch to get the reviews with proper cookies
+	for attempt := 0; attempt < reviewPageAttempts; attempt++ {
+		if attempt > 0 {
+			wait := reviewRetryBaseWait << (attempt - 1)
+			if err := reviewSleep(ctx, wait+randomDelay(0, wait/2)); err != nil {
+				return nil, err
+			}
+		}
+
+		body, err := get(ctx, u)
+		if err == nil && !isReviewPayload(body) {
+			err = errors.New("response is not a review payload")
+		}
+
+		if err == nil {
+			return body, nil
+		}
+
+		lastErr = err
+
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+
+	return nil, lastErr
+}
+
+// isReviewPayload reports whether body is a listugcposts JSON array
+// (optionally prefixed with Google's anti-XSSI guard).
+func isReviewPayload(body []byte) bool {
+	text := strings.TrimSpace(string(body))
+	text = strings.TrimPrefix(text, ")]}'")
+	text = strings.TrimSpace(text)
+
+	if !strings.HasPrefix(text, "[") {
+		return false
+	}
+
+	var arr []any
+
+	return json.Unmarshal([]byte(text), &arr) == nil
+}
+
+func randomDelay(minDelay, maxDelay time.Duration) time.Duration {
+	if maxDelay <= minDelay {
+		return minDelay
+	}
+
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxDelay-minDelay)))
+	if err != nil {
+		return minDelay
+	}
+
+	return minDelay + time.Duration(n.Int64())
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// fetchPageWithBrowser fetches one review page inside the Playwright page, so
+// the request carries the Maps session cookies.
+func (f *fetcher) fetchPageWithBrowser(_ context.Context, u string) ([]byte, error) {
+	encodedURL, err := json.Marshal(u)
+	if err != nil {
+		return nil, err
+	}
+
 	jsCode := fmt.Sprintf(`async () => {
 		try {
-			const response = await fetch('%s', {
+			const response = await fetch(%s, {
 				method: 'GET',
 				credentials: 'include',
 				headers: {
@@ -115,77 +283,32 @@ func (f *fetcher) fetchWithBrowser(_ context.Context, initialURL, requestID stri
 			if (!response.ok) {
 				return { error: 'HTTP ' + response.status };
 			}
-			const text = await response.text();
-			return { data: text };
+			return { data: await response.text() };
 		} catch (e) {
 			return { error: e.message };
 		}
-	}`, initialURL)
+	}`, encodedURL)
 
-	result, err := page.Eval(jsCode)
+	result, err := f.params.page.Eval(jsCode)
 	if err != nil {
-		return ans, fmt.Errorf("browser fetch failed: %w", err)
+		return nil, fmt.Errorf("browser fetch failed: %w", err)
 	}
 
 	resultMap, ok := result.(map[string]interface{})
 	if !ok {
-		return ans, fmt.Errorf("unexpected result type: %T", result)
+		return nil, fmt.Errorf("unexpected result type: %T", result)
 	}
 
-	if errMsg, hasError := resultMap["error"]; hasError {
-		return ans, fmt.Errorf("fetch error: %v", errMsg)
+	if errMsg, hasError := resultMap["error"]; hasError && errMsg != nil {
+		return nil, fmt.Errorf("fetch error: %v", errMsg)
 	}
 
 	data, ok := resultMap["data"].(string)
 	if !ok || len(data) < 10 {
-		return ans, fmt.Errorf("empty response from browser fetch")
+		return nil, fmt.Errorf("empty response from browser fetch")
 	}
 
-	ans.pages = append(ans.pages, []byte(data))
-
-	// Get additional pages
-	nextPageToken := extractNextPageToken([]byte(data))
-	for nextPageToken != "" && len(ans.pages) < 50 { // Limit to 50 pages
-		nextURL, err := f.generateURL(f.params.mapURL, nextPageToken, 20, requestID)
-		if err != nil {
-			break
-		}
-
-		jsCode = fmt.Sprintf(`async () => {
-			try {
-				const response = await fetch('%s', {
-					method: 'GET',
-					credentials: 'include'
-				});
-				if (!response.ok) {
-					return { error: 'HTTP ' + response.status };
-				}
-				return { data: await response.text() };
-			} catch (e) {
-				return { error: e.message };
-			}
-		}`, nextURL)
-
-		result, err = page.Eval(jsCode)
-		if err != nil {
-			break
-		}
-
-		resultMap, ok = result.(map[string]interface{})
-		if !ok || resultMap["error"] != nil {
-			break
-		}
-
-		data, ok = resultMap["data"].(string)
-		if !ok || len(data) < 10 {
-			break
-		}
-
-		ans.pages = append(ans.pages, []byte(data))
-		nextPageToken = extractNextPageToken([]byte(data))
-	}
-
-	return ans, nil
+	return []byte(data), nil
 }
 
 var (
@@ -812,7 +935,9 @@ func FetchReviewsWithFallback(ctx context.Context, params fetchReviewsParams) (F
 		}
 
 		if totalReviews > 0 {
-			log.Printf("RPC extraction successful: %d review pages, ~%d reviews", len(rpcResponse.pages), totalReviews)
+			log.Printf("RPC extraction: %d pages, %d reviews of %d listed on the place%s",
+				len(rpcResponse.pages), totalReviews, params.reviewCount, truncationNote(rpcResponse.truncated))
+
 			return rpcResponse, nil, nil
 		}
 
@@ -838,4 +963,12 @@ func FetchReviewsWithFallback(ctx context.Context, params fetchReviewsParams) (F
 	}
 
 	return rpcResponse, nil, nil
+}
+
+func truncationNote(reason string) string {
+	if reason == "" {
+		return ""
+	}
+
+	return " (INCOMPLETE: " + reason + ")"
 }

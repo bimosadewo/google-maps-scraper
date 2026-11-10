@@ -319,10 +319,26 @@ func (e *Entry) AddExtraReviews(pages [][]byte) {
 		return
 	}
 
+	// Google can repeat a review across page boundaries while paginating; keep
+	// the first copy so totals match the place's real review count.
+	seen := make(map[string]bool, len(e.UserReviewsExtended))
+	for i := range e.UserReviewsExtended {
+		if id := e.UserReviewsExtended[i].ReviewID; id != "" {
+			seen[id] = true
+		}
+	}
+
 	for _, page := range pages {
-		reviews := extractReviews(page)
-		if len(reviews) > 0 {
-			e.UserReviewsExtended = append(e.UserReviewsExtended, reviews...)
+		for _, review := range extractReviews(page) {
+			if review.ReviewID != "" {
+				if seen[review.ReviewID] {
+					continue
+				}
+
+				seen[review.ReviewID] = true
+			}
+
+			e.UserReviewsExtended = append(e.UserReviewsExtended, review)
 		}
 	}
 }
