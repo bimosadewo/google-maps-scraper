@@ -100,8 +100,8 @@ const (
 // Delay between successful pages, randomized within [min, max). Overridable
 // in tests.
 var (
-	reviewPageDelayMin = 300 * time.Millisecond
-	reviewPageDelayMax = 900 * time.Millisecond
+	reviewPageDelayFloor = 300 * time.Millisecond
+	reviewPageDelayCeil = 900 * time.Millisecond
 	reviewSleep        = sleepContext
 )
 
@@ -155,7 +155,7 @@ func (f *fetcher) paginate(ctx context.Context, requestID string, get reviewPage
 			break
 		}
 
-		if err := reviewSleep(ctx, randomDelay(reviewPageDelayMin, reviewPageDelayMax)); err != nil {
+		if err := reviewSleep(ctx, randomDelay(reviewPageDelayFloor, reviewPageDelayCeil)); err != nil {
 			ans.truncated = "cancelled: " + err.Error()
 
 			break

@@ -329,16 +329,17 @@ func (e *Entry) AddExtraReviews(pages [][]byte) {
 	}
 
 	for _, page := range pages {
-		for _, review := range extractReviews(page) {
-			if review.ReviewID != "" {
-				if seen[review.ReviewID] {
+		reviews := extractReviews(page)
+		for i := range reviews {
+			if id := reviews[i].ReviewID; id != "" {
+				if seen[id] {
 					continue
 				}
 
-				seen[review.ReviewID] = true
+				seen[id] = true
 			}
 
-			e.UserReviewsExtended = append(e.UserReviewsExtended, review)
+			e.UserReviewsExtended = append(e.UserReviewsExtended, reviews[i])
 		}
 	}
 }
