@@ -57,6 +57,12 @@ func (f *fetcher) fetch(ctx context.Context) (FetchReviewsResponse, error) {
 
 	// First, try to fetch using the browser's session (has cookies/authentication)
 	if f.params.page != nil {
+		// Signed-in cookies (GMAPS_COOKIES_FILE) are what lets listugcposts
+		// keep answering past the first page instead of HTTP 403.
+		if cerr := applyGoogleCookies(f.params.page); cerr != nil {
+			log.Printf("%v; continuing without them", cerr)
+		}
+
 		ans, err := f.paginate(ctx, requestIDForSession, f.fetchPageWithBrowser)
 		if err == nil && len(ans.pages) > 0 {
 			return ans, nil
