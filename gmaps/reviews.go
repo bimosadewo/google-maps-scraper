@@ -101,8 +101,8 @@ const (
 // in tests.
 var (
 	reviewPageDelayFloor = 300 * time.Millisecond
-	reviewPageDelayCeil = 900 * time.Millisecond
-	reviewSleep        = sleepContext
+	reviewPageDelayCeil  = 900 * time.Millisecond
+	reviewSleep          = sleepContext
 )
 
 // maxReviewPages returns the page cap; GMAPS_MAX_REVIEW_PAGES overrides it
