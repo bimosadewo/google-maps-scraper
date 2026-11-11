@@ -54,6 +54,7 @@ func loadedGoogleCookies() []playwright.OptionalCookie {
 
 		googleCookies = cookies
 
+		//nolint:gosec // only a count and a boolean are logged, never cookie names or values
 		log.Printf("google cookies: %d cookies loaded (signed-in session %v)", len(cookies), hasSessionCookie(cookies))
 	})
 
